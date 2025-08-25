@@ -1,31 +1,71 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-train_nekoqa_lora.py
-正式 LoRA 训练（Unsloth + Gemma-3N）：
-- 读取 JSONL（每行 {"messages":[...]}）
-- 使用 chat_template 渲染为纯文本
-- 自定义 collator：仅在 assistant 段计算 loss
-- 训练中关闭 eval，避免 TorchDynamo 重编译上限错误
-- 可选一键 merge LoRA -> 合并模型
-
-默认数据文件：dataset/NekoQA-10K_convert.jsonl
+train_nekoqa_lora_stable.py
+- 读取 dataset/NekoQA-10K_convert.jsonl（每行 {"messages":[...]}，建议无 system）
+- 动态 collator + 仅在 assistant 段计算 loss（把前缀打 -100）
+- 训练中关闭评估（避开 TorchDynamo 重编译）
+- 可选训练后 merge LoRA
 """
 
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# ✅ Unsloth 要最先导入，确保加速补丁生效
+# ✅ Unsloth 必须最先导入
 from unsloth import FastLanguageModel
 from unsloth.chat_templates import get_chat_template
 
 import argparse
-import json
 import torch
-from datasets import load_dataset
-from trl import SFTTrainer, SFTConfig
+from datasets import load_dataset, Dataset
+from typing import List, Dict
 
-# ========== 自定义 collator：只在 assistant 段计算 loss ==========
+# ===== 可调参数 =====
+BASE_MODEL = "unsloth/gemma-3n-E4B-it"
+CHAT_TEMPLATE_NAME = "gemma-3"
+DATASET_PATH = "dataset/NekoQA-10K_convert.jsonl"
+OUTPUT_DIR = "gemma3n-neko-lora"
+MERGED_DIR = "gemma3n-neko-lora-merged"
+
+# LoRA & 训练
+LORA_R = 32
+LORA_ALPHA = 64
+LORA_DROPOUT = 0.05
+LEARNING_RATE = 2e-4
+MAX_STEPS = 2000
+PER_DEVICE_TRAIN_BSZ = 4
+GRAD_ACC_STEPS = 4
+MAX_SEQ_LEN = 1024
+USE_4BIT = True
+SEED = 3407
+DO_MERGE = False
+
+# ===== 工具函数 =====
+def detect_assistant_prefix(tokenizer) -> str:
+    sentinel = "<|ASSISTANT_CONTENT|>"
+    probe = [
+        {"role": "user", "content": "DUMMY"},
+        {"role": "assistant", "content": sentinel},
+    ]
+    rendered = tokenizer.apply_chat_template(
+        probe, tokenize=False, add_generation_prompt=False
+    )
+    idx = rendered.find(sentinel)
+    if idx == -1:
+        raise RuntimeError("无法探测 assistant 前缀：未找到 sentinel。")
+    start_token = "<start_of_turn>"
+    j = rendered.rfind(start_token, 0, idx)
+    if j != -1:
+        return rendered[j:idx]
+    k = rendered.rfind("\n", 0, idx)
+    return rendered[k+1:idx] if k != -1 else rendered[:idx]
+
+def render_text(tokenizer, msgs: List[Dict[str, str]]) -> str:
+    return tokenizer.apply_chat_template(
+        msgs, tokenize=False, add_generation_prompt=False
+    )
+
+# ===== 自定义 collator：仅在 assistant 段计算 loss (from mini_batch.py) =====
 class AssistantOnlyCollator:
     def __init__(self, tokenizer, assistant_prefix: str, max_seq_len: int):
         self.tokenizer = tokenizer
@@ -42,6 +82,7 @@ class AssistantOnlyCollator:
             max_length=self.max_len,
         )
         labels = enc["input_ids"].clone()
+
         for i, t in enumerate(texts):
             pos = t.find(self.ap)
             if pos == -1:
@@ -53,147 +94,129 @@ class AssistantOnlyCollator:
                 truncation=True, max_length=self.max_len,
             )["input_ids"][0]
             pref_len = pref_ids.shape[0]
-            labels[i, :pref_len] = -100  # 只学习 assistant 段
+            labels[i, :pref_len] = -100
         return {
             "input_ids": enc["input_ids"],
             "attention_mask": enc["attention_mask"],
             "labels": labels,
         }
 
-# ========== 辅助：探测 assistant 段的模板前缀 ==========
-def detect_assistant_prefix(tokenizer):
-    sentinel = "<|ASSISTANT_CONTENT|>"
-    probe_msgs = [
-        {"role": "user", "content": "DUMMY"},
-        {"role": "assistant", "content": sentinel},
-    ]
-    rendered = tokenizer.apply_chat_template(
-        probe_msgs, tokenize=False, add_generation_prompt=False
-    )
-    idx = rendered.find(sentinel)
-    if idx == -1:
-        raise RuntimeError("无法探测 assistant 前缀：渲染结果里没有 sentinel。")
-
-    start_token = "<start_of_turn>"
-    j = rendered.rfind(start_token, 0, idx)
-    if j != -1:
-        assistant_prefix = rendered[j:idx]
-    else:
-        k = rendered.rfind("\n", 0, idx)
-        assistant_prefix = rendered[k+1:idx] if k != -1 else rendered[:idx]
-
-    print(f"[debug] assistant_prefix = {repr(assistant_prefix[:120])} ...")
-    return assistant_prefix
-
-# ========== 主流程 ==========
-def main():
-    ap = argparse.ArgumentParser()
-    # 数据 & 模型
-    ap.add_argument("--dataset_path", type=str, default="dataset/NekoQA-10K_convert.jsonl")
-    ap.add_argument("--base_model", type=str, default="unsloth/gemma-3n-E4B-it")
-    ap.add_argument("--chat_template", type=str, default="gemma-3")
-    ap.add_argument("--output_dir", type=str, default="nekoqa-lora-out")
-    ap.add_argument("--merged_dir", type=str, default="nekoqa-gemma3n-merged")
-    ap.add_argument("--max_seq_len", type=int, default=1024)
-    ap.add_argument("--load_in_4bit", action="store_true", default=True)
-
-    # 训练超参
-    ap.add_argument("--per_device_train_batch_size", type=int, default=4)
-    ap.add_argument("--gradient_accumulation_steps", type=int, default=2)
-    ap.add_argument("--learning_rate", type=float, default=2e-4)
-    ap.add_argument("--num_train_epochs", type=int, default=1)
-    ap.add_argument("--max_steps", type=int, default=-1)   # >0 则覆盖 epochs
-    ap.add_argument("--warmup_steps", type=int, default=100)
-    ap.add_argument("--logging_steps", type=int, default=20)
-    ap.add_argument("--save_steps", type=int, default=1000)
-    ap.add_argument("--seed", type=int, default=3407)
-
-    # LoRA
-    ap.add_argument("--lora_r", type=int, default=32)
-    ap.add_argument("--lora_alpha", type=int, default=64)
-    ap.add_argument("--lora_dropout", type=float, default=0.0)  # 大数据建议 0.0 更快
-
-    # 其他
-    ap.add_argument("--merge_lora", action="store_true", default=False,
-                    help="训练后是否 merge_and_unload 生成合并模型")
-
-    args = ap.parse_args()
-
-    print(f">> 读取数据：{args.dataset_path}")
-    ds = load_dataset("json", data_files=args.dataset_path, split="train")
-    # 期望每条样本形如 {"messages":[{"role":"user","content":...},{"role":"assistant","content":...}]}
-
-    print(">> 加载模型/分词器 …")
+# ===== 模型 & tokenizer & 生成 =====
+def load_model_and_tokenizer():
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=args.base_model,
-        max_seq_length=args.max_seq_len,
+        model_name=BASE_MODEL,
+        max_seq_length=MAX_SEQ_LEN,
         dtype=None,
-        load_in_4bit=args.load_in_4bit,
+        load_in_4bit=USE_4BIT,
     )
-
-    # 训练阶段禁用缓存，减少编译/图切换干扰
     if hasattr(model, "config"):
         model.config.use_cache = False
 
-    # 挂 LoRA
     model = FastLanguageModel.get_peft_model(
         model,
-        r=args.lora_r,
+        r=LORA_R,
         target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
+        lora_alpha=LORA_ALPHA,
+        lora_dropout=LORA_DROPOUT,
         bias="none",
         use_gradient_checkpointing=True,
-        random_state=args.seed,
+        random_state=SEED,
         use_rslora=False,
         loftq_config=None,
     )
 
-    # 套 chat 模板（推理/渲染时用）
-    tokenizer = get_chat_template(tokenizer, chat_template=args.chat_template)
+    tokenizer = get_chat_template(tokenizer, chat_template=CHAT_TEMPLATE_NAME)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"
+    return model, tokenizer
 
-    # 渲染为纯文本
-    print(">> 渲染文本 …")
-    def format_batch(examples):
-        msgs_list = examples["messages"]
-        texts = [
-            tokenizer.apply_chat_template(m, tokenize=False, add_generation_prompt=False)
-            for m in msgs_list
-        ]
-        return {"text": texts}
+def quick_generate_no_system(model, tokenizer, user_text):
+    msgs = [{"role": "user", "content": user_text}]
+    prompt = tokenizer.apply_chat_template(
+        msgs, tokenize=False, add_generation_prompt=True
+    )
+    # ⭐ 同样使用 text=[...] 关键字参数
+    inputs = tokenizer(text=[prompt], return_tensors="pt", padding=True)
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    with torch.no_grad():
+        out = model.generate(
+            **inputs,
+            max_new_tokens=200,
+            do_sample=True, temperature=0.8, top_p=0.9,
+            repetition_penalty=1.15,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+    input_len = inputs["input_ids"].shape[1]
+    gen_ids = out[0][input_len:]
+    return tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
 
-    ds_text = ds.map(format_batch, batched=True, remove_columns=[c for c in ds.column_names if c != "messages"])
-    # 有的 datasets 版本不允许 remove_columns 移除所有列，这里保留 "messages"
-    ds_text = ds_text.remove_columns([c for c in ds_text.column_names if c not in ("messages","text")])
+# ===== 主流程 =====
+def main():
+    import random
+    from trl import SFTTrainer, SFTConfig
 
-    # 探测 assistant 段前缀 & collator
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset_path", type=str, default=DATASET_PATH)
+    parser.add_argument("--output_dir", type=str, default=OUTPUT_DIR)
+    parser.add_argument("--merged_dir", type=str, default=MERGED_DIR)
+    parser.add_argument("--max_steps", type=int, default=MAX_STEPS)
+    parser.add_argument("--per_device_train_batch_size", type=int, default=PER_DEVICE_TRAIN_BSZ)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=GRAD_ACC_STEPS)
+    parser.add_argument("--learning_rate", type=float, default=LEARNING_RATE)
+    parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--do_merge", action="store_true", default=DO_MERGE)
+    args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+
+    print(f">> 读取数据：{args.dataset_path}")
+    ds = load_dataset("json", data_files=args.dataset_path, split="train")
+
+    print(">> 加载模型…")
+    model, tokenizer = load_model_and_tokenizer()
+
+    print("\n[训练前] 生成示例：")
+    print(quick_generate_no_system(model, tokenizer, "宝宝，如果我走了，你会怎么做？"), "\n")
+
     apref = detect_assistant_prefix(tokenizer)
-    collator = AssistantOnlyCollator(tokenizer, apref, args.max_seq_len)
+    print(f"[debug] assistant_prefix = {repr(apref[:80])} ...")
 
-    # 训练器配置（关闭 eval）
-    print(">> 配置 SFTTrainer …")
+    print(">> 渲染数据为 text 格式…")
+    def _render_to_text(examples):
+        return {"text": [render_text(tokenizer, m) for m in examples["messages"]]}
+
+    train_text = ds.map(
+        _render_to_text,
+        batched=True,
+        remove_columns=ds.column_names,
+    )
+
+    collator = AssistantOnlyCollator(tokenizer, apref, MAX_SEQ_LEN)
+
+    print(">> 配置 SFTTrainer（无评估）…")
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
-        train_dataset=ds_text,
+        train_dataset=train_text,
         data_collator=collator,
+        dataset_text_field="text",
         args=SFTConfig(
             per_device_train_batch_size=args.per_device_train_batch_size,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             learning_rate=args.learning_rate,
-            warmup_steps=args.warmup_steps,
-            max_steps=args.max_steps if args.max_steps > 0 else -1,
-            num_train_epochs=args.num_train_epochs,
-            logging_steps=args.logging_steps,
+            warmup_steps=100,
+            max_steps=args.max_steps,
+            num_train_epochs=1,            # 被 max_steps 覆盖
+            logging_steps=20,
 
             eval_strategy="no",
             load_best_model_at_end=False,
 
             save_strategy="steps",
-            save_steps=args.save_steps,
+            save_steps=args.max_steps,     # 结束时存一次
             output_dir=args.output_dir,
 
             fp16=not torch.cuda.is_bf16_supported(),
@@ -202,25 +225,23 @@ def main():
             weight_decay=0.0,
             seed=args.seed,
             packing=False,
-            max_seq_length=args.max_seq_len,
+            max_seq_length=MAX_SEQ_LEN,
         ),
-        dataset_text_field="text",
     )
 
-    print("\n==> 开始训练 …")
+    print("\n>> 开始训练 …")
     trainer.train()
 
     print("\n>> 保存 LoRA 适配器 …")
     model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
-    print(f"LoRA 已保存至：{args.output_dir}")
 
-    if args.merge_lora:
-        print("\n>> 合并 LoRA 到基座（merge_and_unload） …")
+    if args.do_merge:
+        print("\n>> 合并 LoRA 到基座（merge_and_unload）…")
         from transformers import AutoModelForCausalLM
         from peft import PeftModel
         base = AutoModelForCausalLM.from_pretrained(
-            args.base_model, torch_dtype=torch.bfloat16, device_map="auto"
+            BASE_MODEL, torch_dtype=torch.bfloat16, device_map="auto"
         )
         peft = PeftModel.from_pretrained(base, args.output_dir)
         merged = peft.merge_and_unload()
@@ -229,8 +250,9 @@ def main():
         tokenizer.save_pretrained(args.merged_dir)
         print(f"合并完成：{args.merged_dir}")
 
-    print("\n✅ 训练完成。")
-
+    print("\n[训练后] 生成示例：")
+    print(quick_generate_no_system(model, tokenizer, "早晨如何与主人互动？"))
+    print(f"\n✅ 完成！LoRA 保存在: {args.output_dir}" + (f"；合并模型在: {args.merged_dir}" if args.do_merge else ""))
 
 if __name__ == "__main__":
     main()
