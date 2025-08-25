@@ -1,65 +1,93 @@
-import json
-import argparse
-import os
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+把 [{"instruction": "...", "output": "..."}] 转成 messages JSONL：
+{"messages":[{"role":"user","content":...},{"role":"assistant","content":...}]}
 
-def convert_to_sharegpt(input_file, output_file):
-    """
-    将包含 "instruction" 和 "output" 的 JSON 文件转换为 ShareGPT 格式的 JSONL 文件。
+用法：
+  python convert_inst2messages.py \
+    --input data.json \          # 支持 .json（数组）或 .jsonl
+    --output catgirl_messages.jsonl \
+    --with-system \              # 可选：加一段固定人设
+    --persona "你是可爱黏人的猫娘助手，称呼用户为“主人”。说话自然、有拟声词，且有信息量。"
 
-    Args:
-        input_file (str): 输入的 JSON 文件路径。
-        output_file (str): 输出的 JSONL 文件路径。
-    """
-    print(f"开始转换文件: {input_file}")
-    
-    try:
-        with open(input_file, 'r', encoding='utf-8') as f:
+转换后可直接被你的 SFT 脚本读取（load_dataset('json', data_files=..., split='train')）。
+"""
+import argparse, json, os, sys, io, random
+from typing import Iterable, Dict
+
+def read_json_or_jsonl(path: str) -> Iterable[Dict]:
+    if path.endswith(".jsonl"):
+        with io.open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    yield obj
+                except Exception as e:
+                    sys.stderr.write(f"[warn] 跳过一行（JSON 解析失败）：{e}\n")
+    else:
+        with io.open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-    except json.JSONDecodeError:
-        print(f"错误: 输入文件 '{input_file}' 不是有效的 JSON 格式。")
-        return
-    except FileNotFoundError:
-        print(f"错误: 输入文件 '{input_file}' 未找到。")
-        return
+        if isinstance(data, dict):
+            # 兼容 {"data":[...]}
+            data = data.get("data", [])
+        if not isinstance(data, list):
+            raise ValueError("JSON 顶层应为数组或含 data 数组的对象。")
+        for obj in data:
+            yield obj
 
-    # 确保输出目录存在
-    output_dir = os.path.dirname(output_file)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
+def normalize_text(s: str) -> str:
+    if not isinstance(s, str):
+        s = "" if s is None else str(s)
+    return s.strip()
 
-    converted_count = 0
-    with open(output_file, 'w', encoding='utf-8') as f_out:
-        for item in data:
-            if "instruction" in item and "output" in item:
-                conversation = {
-                    "conversations": [
-                        {"from": "human", "value": item["instruction"]},
-                        {"from": "gpt", "value": item["output"]}
-                    ]
-                }
-                f_out.write(json.dumps(conversation, ensure_ascii=False) + '\n')
-                converted_count += 1
-    
-    print(f"转换完成！总共转换了 {converted_count} 条记录。")
-    print(f"转换后的文件已保存至: {output_file}")
+def convert_item(obj: Dict, add_system: bool, persona: str) -> Dict:
+    instr = normalize_text(obj.get("instruction", ""))
+    out   = normalize_text(obj.get("output", ""))
+    if not instr or not out:
+        raise ValueError("缺少 instruction 或 output")
+    msgs = []
+    if add_system and persona:
+        msgs.append({"role": "system", "content": persona})
+    msgs.append({"role": "user", "content": instr})
+    msgs.append({"role": "assistant", "content": out})
+    return {"messages": msgs}
 
 def main():
-    parser = argparse.ArgumentParser(description="将 instruction/output 格式的 JSON 转换为 ShareGPT 格式的 JSONL。")
-    parser.add_argument(
-        "--input_file",
-        type=str,
-        required=True,
-        help="输入的 JSON 文件路径 (例如: dataset/NekoQA-10K.json)"
-    )
-    parser.add_argument(
-        "--output_file",
-        type=str,
-        required=True,
-        help="输出的 JSONL 文件路径 (例如: dataset/NekoQA-10K_converted.jsonl)"
-    )
-    args = parser.parse_args()
-    
-    convert_to_sharegpt(args.input_file, args.output_file)
+    ap = argparse.ArgumentParser(description="Convert instruction/output to messages JSONL")
+    ap.add_argument("--input", required=True, help="输入文件：.json（数组）或 .jsonl")
+    ap.add_argument("--output", required=True, help="输出 JSONL 路径")
+    ap.add_argument("--with-system", action="store_true", help="是否为每条样本添加固定 system 人设")
+    ap.add_argument("--persona", type=str, default="你是可爱黏人的猫娘助手，称呼用户为“主人”。说话自然、轻松、带拟声词和表情，但回答要有信息量，遵守安全与法律。",
+                    help="--with-system 时使用的人设文本")
+    ap.add_argument("--shuffle", action="store_true", help="输出前随机打乱样本")
+    ap.add_argument("--seed", type=int, default=42, help="shuffle 随机种子")
+    args = ap.parse_args()
+
+    items = []
+    for obj in read_json_or_jsonl(args.input):
+        try:
+            items.append(convert_item(obj, args.with_system, args.persona))
+        except Exception as e:
+            sys.stderr.write(f"[warn] 跳过一条样本：{e}\n")
+
+    if args.shuffle:
+        random.seed(args.seed)
+        random.shuffle(items)
+
+    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+    with io.open(args.output, "w", encoding="utf-8") as w:
+        for ex in items:
+            w.write(json.dumps(ex, ensure_ascii=False) + "\n")
+
+    print(f"✅ 转换完成：{len(items)} 条")
+    # 打印一条样例预览
+    if items:
+        preview = json.dumps(items[0], ensure_ascii=False, indent=2)
+        print("— 示例 —\n" + preview)
 
 if __name__ == "__main__":
     main()

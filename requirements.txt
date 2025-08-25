@@ -13,3 +13,5 @@ torch
 
 # For 4-bit quantization
 bitsandbytes
+
+timm
