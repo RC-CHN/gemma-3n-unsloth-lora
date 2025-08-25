@@ -38,7 +38,7 @@ GRAD_ACC_STEPS = 4
 MAX_SEQ_LEN = 1024
 USE_4BIT = True
 SEED = 3407
-DO_MERGE = False
+DO_MERGE = True
 
 # ===== 工具函数 =====
 def detect_assistant_prefix(tokenizer) -> str:

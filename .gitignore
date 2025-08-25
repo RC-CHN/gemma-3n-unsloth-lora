@@ -1,2 +1,4 @@
 .venv/
 unsloth_compiled_cache/
+gemma3n-neko-lora/
+gemma3n-neko-lora-merged/
