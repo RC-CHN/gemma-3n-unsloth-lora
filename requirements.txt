@@ -1,0 +1,15 @@
+# Unsloth Core - an optimized training and inference library
+unsloth[cu121]
+
+# Hugging Face libraries for models, datasets, and training
+transformers
+datasets
+trl
+peft
+accelerate
+
+# Core ML library
+torch
+
+# For 4-bit quantization
+bitsandbytes
