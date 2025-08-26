@@ -15,3 +15,5 @@ torch
 bitsandbytes
 
 timm
+gguf
+mistral_common

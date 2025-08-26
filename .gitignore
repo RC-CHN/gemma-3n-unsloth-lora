@@ -2,3 +2,5 @@
 unsloth_compiled_cache/
 gemma3n-neko-lora/
 gemma3n-neko-lora-merged/
+gemma3n-neko-lora-merged-fp16/
+gguf/
